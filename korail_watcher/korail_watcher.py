@@ -8,10 +8,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ====== 사용자 설정 ======
 ORIGIN = "창원중앙"          # 출발역
 DEST = "서울"            # 도착역
-DATE = "2025-08-31"      # YYYY-MM-DD
-TARGET_WINDOW = ("16:00", "22:00")  # 감시 시각대
+DATE = "2025-09-10"      # YYYY-MM-DD
+TARGET_WINDOW = ("10:00", "22:00")  # 감시 시각대
 TRAIN_TYPES = {"KTX", "SRT"}  # 필터. 비우면 전체
-REFRESH_SEC = 45         # 재조회 간격(초). 과도한 요청은 피하세요.
+REFRESH_SEC = 20         # 재조회 간격(초). 과도한 요청은 피하세요.
 STOP_ON_FIRST_HIT = True # 첫 발견 시 종료 여부
 HEADLESS = True          # 로그인이 필요하면 False로 띄워서 처리
 
@@ -21,16 +21,20 @@ AVAILABLE_PAT = re.compile(r"예약\s*가능|잔여\s*좌석|잔여석|여유|�
 TIME_PAT = re.compile(r"(\d{2}:\d{2})")
 # ====== 셀렉터(한 번만 수정해서 맞추면 됨) ======
 SEL = {
-    "origin_input": "#dep-station",    # 출발역 입력칸
-    "dest_input": "#arr-station",      # 도착역 입력칸
-    "date_input": "#ride-date",        # 날짜 입력칸
-    "search_btn":  "#search-btn",      # 조회 버튼
-    "result_rows": "table.result tbody tr",  # 결과 행
-    "col_train":   "td:nth-child(1)",
-    "col_time":    "td:nth-child(2)",
-    "col_status":  "td:nth-child(7)",  # 예약 상태/잔여석
+    "origin_input": "input[placeholder='출발역'], input[aria-label='출발역']",
+    "dest_input":   "input[placeholder='도착역'], input[aria-label='도착역']",
+    "date_input":   "input[type='date'], input[aria-label='승차일자'], input[name='rideDate']",
+    "ac_list":      "ul[role='listbox'], .autocomplete-list, .suggest-list",
+    "ac_option":    "li[role='option'], .autocomplete-item, .suggest-item",
+    "search_btn":   "button[type='submit'], button:has-text('조회'), button[aria-label='조회']",
+    "result_rows":  "table tbody tr, .result-list .result-item",
+    "col_train":    "td:nth-child(1)",
+    "col_time":     "td:nth-child(2)",
+    "col_status":   "td:nth-child(7)",
+    "reserve_btn":  "button:has-text('예약'), button:has-text('구매'), a:has-text('예약')",
+    "soldout_badge":".badge:has-text('매진'), .chip:has-text('매진')",
 }
-URL = "https://www.letskorail.com/"  # 실제 검색 페이지 URL로 교체
+URL = "https://www.korail.com/ticket/search/general#"  # 코레일 새 검색 페이지
 
 # ====== 알림 ======
 load_dotenv()
@@ -85,9 +89,42 @@ def scrape_once(page):
     TIMEOUT_MS = 60000
     page.goto(URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
     # 입력
+    page.fill(SEL["origin_input"], "")
     page.fill(SEL["origin_input"], ORIGIN)
+    # 자동완성 확정(가능한 경우)
+    try:
+        ac = page.locator(SEL["ac_list"]).first
+        if ac.is_visible():
+            page.locator(SEL["ac_option"]).first.click()
+        else:
+            page.keyboard.press("Enter")
+    except Exception:
+        pass
+
+    page.fill(SEL["dest_input"], "")
     page.fill(SEL["dest_input"], DEST)
-    page.fill(SEL["date_input"], DATE)
+    try:
+        ac = page.locator(SEL["ac_list"]).first
+        if ac.is_visible():
+            page.locator(SEL["ac_option"]).first.click()
+        else:
+            page.keyboard.press("Enter")
+    except Exception:
+        pass
+
+    # 날짜 설정: type=date가 아니면 JS로 value 설정 후 change 이벤트 디스패치
+    try:
+        page.fill(SEL["date_input"], DATE)
+    except Exception:
+        try:
+            page.eval_on_selector(
+                SEL["date_input"],
+                "(el, v)=>{el.value=v; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));}",
+                arg=DATE,
+            )
+        except Exception:
+            pass
+
     page.click(SEL["search_btn"])
     # 네트워크 안정 상태 대기
     try:
@@ -130,11 +167,34 @@ def scrape_once(page):
                     continue
         except Exception:
             rows = []
+    # 디버깅: 여전히 못 찾았으면 스냅샷 저장
+    if not rows:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            page.screenshot(path=f"korail_snapshot_{ts}.png")
+        except Exception:
+            pass
+        try:
+            html = page.content()
+            with open(f"korail_page_{ts}.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
     hits = []
     for r in rows:
+        # 카드형 대비: 기본은 테이블 열, 보조로 버튼/배지 확인
         train_txt = safe_text(r, SEL["col_train"])
         time_txt  = safe_text(r, SEL["col_time"])
         stat_txt  = safe_text(r, SEL["col_status"])
+        try:
+            has_reserve = bool(r.query_selector(SEL["reserve_btn"]))
+            is_soldout  = bool(r.query_selector(SEL["soldout_badge"]))
+            if has_reserve:
+                stat_txt = (stat_txt + " 예약가능").strip()
+            if is_soldout:
+                stat_txt = (stat_txt + " 매진").strip()
+        except Exception:
+            pass
 
         # 시간 추출
         m = TIME_PAT.search(time_txt)
